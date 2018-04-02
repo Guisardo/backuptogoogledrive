@@ -4,13 +4,16 @@ A cli tool to backup a site's codebase and database to google drive.
 
 ## Installation
 
-TODO: Describe the installation process
+ - Clone repository content
+ - Run `composer install`
 
 ## Usage
 
-TODO: Write usage instructions
- - Add account settings to settings.inc.php
- - Add one or more site configurations to mysite.site.inc
+ - Add server settings based on `globals.ini.sample`
+ - Add one or more app configurations based on `example.ini.sample`
+ - Add cron job to execute `php backuptogoogledrive.php`
+
+You can also force the execution of a specific app backup using the `--app=example` parameter.
 
 ## Contributing
 
@@ -19,6 +22,15 @@ TODO: Write usage instructions
 3. Commit your changes: `git commit -am 'Add some feature'`
 4. Push to the branch: `git push origin my-new-feature`
 5. Submit a pull request :D
+
+## TODO
+
+ - The docs
+ - Locking code to prevent overlapping executions
+ - LOGS!!
+ - Notifications
+ - UI for de configs and for monitoring
+ - Encrypt .scrt files
 
 ## History
 
