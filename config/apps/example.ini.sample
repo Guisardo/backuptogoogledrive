@@ -1,0 +1,19 @@
+docroot= "backuptogoogledrive"
+exclude_paths[]= "tmp"
+exclude_paths[]= "vendor"
+
+;dbname= "database_name"
+;dbuser= "database_user"
+;dbpass= "database_pass"
+;dbhost= "database_host"
+;dbport= "database_port"
+
+
+backup_every= "1 day"
+remove_after= "3 days"
+
+parent_folder= "backups"
+; Google Drive Client ID.
+client_id= "..."
+; Google Drive Client Secret.
+client_secret= "..."

@@ -8,12 +8,10 @@
 
 set_time_limit(0);
 
-include_once __DIR__ . '/vendor/autoload.php';
-include_once __DIR__ . "/settings.inc";
+include_once __DIR__ . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+include_once __DIR__ . DIRECTORY_SEPARATOR . "settings.inc.php";
 
-define('GOOGLECREDENTIALSPATH', '~/.credentials/google-drive.json');
-define('GOOGLECLIENTID', $client_id);
-define('GOOGLECLIENTSECRET', $client_secret);
+define('GOOGLECREDENTIALSPATH', __DIR__ . DIRECTORY_SEPARATOR . 'google-drive');
 define('GOOGLEREQUESTURI', $request_uri);
 define('BACKUPSTMPDIR', $fileroot);
 define('WEBROOT', $webroot);
@@ -24,17 +22,19 @@ define('SCOPES', implode(' ', array(
 /**
  * Iterate over $sites.
  */
-foreach ($sites as $site) {
-  echo ('Starting backup for ' . $site['name'] . '.' . PHP_EOL);
+foreach ($sites as $site_name => $site_config) {
+  if (!existsBackup($site_name, $site_config)) {
+    echo ('Starting backup for ' . $site_name . '.' . PHP_EOL);
 
-  // Generate the site archive. If database credentials were included generate
-  // the database archive as well.
-  archive($site, $webroot);
+    // Generate the site archive. If database credentials were included generate
+    // the database archive as well.
+    archive($site_name, $site_config, $webroot);
 
-  // Cleanup any archive files leftover in the tmp directory.
-  cleanup();
+    // Cleanup any archive files leftover in the tmp directory.
+    cleanup();
 
-  echo ('Backup complete for ' . $site['name'] . '.' . PHP_EOL);
+    echo ('Backup complete for ' . $site_name . '.' . PHP_EOL);
+  }
 }
 
 /**
@@ -49,24 +49,46 @@ foreach ($sites as $site) {
  * @return bool
  *   Status of the operation.
  */
-function archive($site, $webroot = '') {
+function archive($site_name, $site, $webroot = '') {
   if (!$site['docroot']) {
     return FALSE;
   }
 
   // Use the current date/time as unique identifier.
   $timestamp = date("YmdHis");
-  $fileroot = BACKUPSTMPDIR;
-  $site_archive = $fileroot . '/' . $timestamp . '_' . $site['dbname'] . ".tar.gz";
+  $destination = $site_name . DIRECTORY_SEPARATOR;
+  if (isset($site['parent_folder'])) {
+    $destination = $site['parent_folder'] . DIRECTORY_SEPARATOR . $destination;
+  }
+  if (isset($site['docroot'])) {
+    $fileroot = BACKUPSTMPDIR;
+    $site_archive = $fileroot . DIRECTORY_SEPARATOR . $site_name . '_' . $timestamp . ".tar.gz";
 
-  // Create tar.gz file.
-  shell_exec("cd " . $webroot . " && tar cf - " . $site['docroot'] . " -C " . $webroot . " | gzip -9 > " . $site_archive);
-  send_archive_to_drive($site_archive, $site['name'] . '/codebase backups');
+    // Create tar.gz file.
+    $command = "cd " . $webroot . " && tar";
+    if (isset($site['exclude_paths'])) {
+      foreach ($site['exclude_paths'] as $exclusion) {
+        $command .= ' --exclude ' . $exclusion;
+      }
+    }
+    $command .= " -C " . $webroot . DIRECTORY_SEPARATOR . $site['docroot'] . " -cf " . " - . | gzip -9 > " . $site_archive;
+    shell_exec($command);
+    send_archive_to_drive($site, $site_archive, $destination . 'files');
+  }
+  if (isset($site['dbname'])) {
+    $db_archive = $fileroot . DIRECTORY_SEPARATOR . $site['dbname'] . '_' . $timestamp . ".sql.gz";
+    $command = "mysqldump -u" . $site['dbuser'] . " -p'" . $site['dbpass'] . "'";
+    if (isset($site['dbhost'])) {
+      $command .= " -h " .  $site['dbhost'];
+    }
+    if (isset($site['dbport'])) {
+      $command .= " --port " .  $site['dbport'];
+    }
+    $command .=  " " . $site['dbname'];
 
-  if ($site['dbuser'] && $site['dbpass'] && $site['dbname']) {
-    $db_archive = $fileroot . '/' . $timestamp . '_' . $site['dbname'] . ".sql.gz";
-    shell_exec("mysqldump -u" . $site['dbuser'] . " -p" . $site['dbpass'] . " " . $site['dbname'] . " | gzip -9 > " . $db_archive);
-    send_archive_to_drive($db_archive, $site['name'] . '/database backups');
+    $command .= " | gzip -9 > " . $db_archive; 
+    shell_exec($command);
+    send_archive_to_drive($site, $db_archive, $destination . 'database');
   }
 }
 
@@ -81,42 +103,77 @@ function archive($site, $webroot = '') {
  * @param bool $cleanup
  *   If true, remove the file after upload.
  */
-function send_archive_to_drive($file_path, $directory, $cleanup = TRUE) {
-  $client = get_client();
+function send_archive_to_drive($site, $file_path, $directory, $cleanup = TRUE) {
+  $client = get_client($site);
   $service = new Google_Service_Drive($client);
-  $result = uploadArchive($service, $file_path, $directory);
+  $result = uploadArchive($client, $service, $file_path, $directory);
 
   if ($result && $cleanup) {
     unlink($file_path);
   }
 }
 
-function uploadArchive($service, $file_path, $directory) {
+function uploadArchive($client, $service, $file_path, $directory) {
+  $chunkSizeBytes = 1 * 1024 * 1024;
+
   $file = new Google_Service_Drive_DriveFile();
   $file->setName(basename($file_path));
   $file->setDescription("Reese Creative Backup file.");
   $file->setMimeType("application/gzip");
   $file->setParents(array(prepare_drive_path($service, $directory)));
-  $data = file_get_contents($file_path);
-  return $service->files->create($file, array('data' => $data, 'mimeType' => "application/gzip"));
+
+  $client->setDefer(true);
+  $request = $service->files->create($file);
+
+  // Create a media file upload to represent our upload process.
+  $media = new Google_Http_MediaFileUpload(
+      $client,
+      $request,
+      'application/gzip',
+      null,
+      true,
+      $chunkSizeBytes
+  );
+  $media->setFileSize(filesize($file_path));
+  // Upload the various chunks. $status will be false until the process is
+  // complete.
+  $status = false;
+  $handle = fopen($file_path, "rb");
+  while (!$status && !feof($handle)) {
+    // read until you get $chunkSizeBytes from TESTFILE
+    // fread will never return more than 8192 bytes if the stream is read buffered and it does not represent a plain file
+    // An example of a read buffered file is when reading from a URL
+    $chunk = readFromBigChunk($handle, $chunkSizeBytes);
+    $status = $media->nextChunk($chunk);
+  }
+  // The final value of $status will be the data from the API for the object
+  // that has been uploaded.
+  $result = false;
+  if ($status != false) {
+    $result = $status;
+  }
+  fclose($handle);
+
+  return $result;
 }
 
-/**
- * Expands the home directory alias '~' to the full path.
- *
- * @param string $path
- *   The path to expand.
- *
- * @return string
- *   The expanded path.
- */
-function expand_home_dir($path) {
-  $home_dir = getenv('HOME');
-  if (empty($home_dir)) {
-    $home_dir = getenv("HOMEDRIVE") . getenv("HOMEPATH");
-  }
-  return str_replace('~', realpath($home_dir), $path);
+function readFromBigChunk($handle, $chunkSize)
+{
+    $byteCount = 0;
+    $giantChunk = "";
+    while (!feof($handle)) {
+        // fread will never return more than 8192 bytes if the stream is read buffered and it does not represent a plain file
+        $chunk = fread($handle, 8192);
+        $byteCount += strlen($chunk);
+        $giantChunk .= $chunk;
+        if ($byteCount >= $chunkSize)
+        {
+            return $giantChunk;
+        }
+    }
+    return $giantChunk;
 }
+
 
 /**
  * Get an authenticated google Client.
@@ -124,17 +181,18 @@ function expand_home_dir($path) {
  * @return \Google_Client
  *   The google client.
  */
-function get_client() {
+function get_client($site) {
   $client = new Google_Client();
 
   // Get your credentials from the APIs Console.
-  $client->setClientId(GOOGLECLIENTID);
-  $client->setClientSecret(GOOGLECLIENTSECRET);
+  $client->setClientId($site['client_id']);
+  $client->setClientSecret($site['client_secret']);
   $client->setRedirectUri(GOOGLEREQUESTURI);
   $client->setAccessType("offline");
+  $client->setApprovalPrompt('force');
   $client->setScopes(SCOPES);
 
-  $credentials = expand_home_dir(GOOGLECREDENTIALSPATH);
+  $credentials = GOOGLECREDENTIALSPATH.str_replace('.apps.googleusercontent.com', '', $site['client_id']).'.scrt';
   if (!file_exists($credentials)) {
     // Exchange authorization code for access token.
     $auth_url = $client->createAuthUrl();
@@ -155,6 +213,7 @@ function get_client() {
     if (!file_exists(dirname($credentials))) {
       mkdir(dirname($credentials));
     }
+
     file_put_contents($credentials, json_encode($access_token));
     printf("Credentials saved to %s\n", $credentials);
   }
@@ -186,7 +245,7 @@ function get_client() {
  *   The id of the last folder component in the path.
  */
 function prepare_drive_path($service, $path) {
-  $folders = explode('/', $path);
+  $folders = explode(DIRECTORY_SEPARATOR, $path);
   $id = NULL;
   for ($i = 0; $i < count($folders); $i++) {
     $parent = $i > 0 ? $folders[$i - 1] : NULL;
@@ -249,13 +308,13 @@ function prepare_folder(Google_Service_Drive $service, $folder, $parent = NULL) 
  * This is not run by default, but could be used to backup stray files to google
  * drive before cleanup().
  */
-function send_orphaned_archives_to_drive() {
-  $client = get_client();
+function send_orphaned_archives_to_drive($site) {
+  $client = get_client($site);
   $service = new Google_Service_Drive($client);
 
   if ($files = find_archives()) {
     foreach ($files as $file_path) {
-      uploadArchive($service, $file_path, 'unsorted');
+      uploadArchive($client, $service, $file_path, 'unsorted');
       unlink($file_path);
     }
   };
@@ -278,5 +337,42 @@ function cleanup() {
  *   The array of files matching the globbing pattern "*.gz".
  */
 function find_archives() {
-  return glob(BACKUPSTMPDIR . '/*.gz');
+  return glob(BACKUPSTMPDIR . DIRECTORY_SEPARATOR . '*.gz');
+}
+
+
+
+function existsBackup($site_name, $site)
+{
+  $result = false;
+  $client = get_client($site);
+  $service = new Google_Service_Drive($client);
+
+  if (isset($site['remove_after'])) {
+    $remove_after = date('c', strtotime('-' . $site['remove_after']));
+    // Print the names and IDs for up to 10 files.
+    $optParams = array(
+      'pageSize' => 100,
+      'q' => '((name contains \'' . $site['dbname'] . '\' and name contains \'.sql.gz\') or (name contains \'' . $site_name . '\' and name contains \'.tar.gz\')) and modifiedTime < \'' . $remove_after . '\''
+    );
+    $files_to_remove = $service->files->listFiles($optParams);
+    if (count($files_to_remove->getFiles()) > 0) {
+      print "Removing Files:\n";
+      foreach ($files_to_remove->getFiles() as $file) {
+        printf("%s (%s)\n", $file->getName(), $file->getId());
+        $service->files->delete($file->getId());
+      }
+    }
+  }
+  if (isset($site['backup_every'])) {
+    $backup_every = date('c', strtotime('-' . $site['backup_every']));
+    // Print the names and IDs for up to 10 files.
+    $optParams = array(
+      'pageSize' => 100,
+      'q' => '((name contains \'' . $site['dbname'] . '\' and name contains \'.sql.gz\') or (name contains \'' . $site_name . '\' and name contains \'.tar.gz\')) and modifiedTime > \'' . $backup_every . '\''
+    );
+    $result = count($service->files->listFiles($optParams)->getFiles()) > 0;
+  }
+
+  return $result;
 }
