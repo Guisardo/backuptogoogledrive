@@ -1,0 +1,10 @@
+version: '3'
+
+services:
+  backupper:
+    build:
+        dockerfile: ..\docker\Dockerfile
+        context: ..\src
+    volumes:
+      - "../src:/src"
+      - "../tmp:/tmp"

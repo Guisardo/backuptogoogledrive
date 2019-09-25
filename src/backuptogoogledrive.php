@@ -8,12 +8,13 @@
 
 set_time_limit(0);
 
-include_once __DIR__ . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+include_once DIRECTORY_SEPARATOR.'tools'. DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
 include_once __DIR__ . DIRECTORY_SEPARATOR . "settings.inc.php";
 
 define('GOOGLECREDENTIALSPATH', __DIR__ . DIRECTORY_SEPARATOR . 'google-drive');
 define('GOOGLEREQUESTURI', $request_uri);
 define('BACKUPSTMPDIR', $fileroot);
+define('STORAGELIMIT', $globals_settings['storage_limit']);
 define('WEBROOT', $webroot);
 define('SCOPES', implode(' ', array(
   Google_Service_Drive::DRIVE
@@ -56,13 +57,15 @@ function archive($site_name, $site, $webroot = '') {
 
   // Use the current date/time as unique identifier.
   $timestamp = date("YmdHis");
-  $destination = $site_name . DIRECTORY_SEPARATOR;
+  $destination = $site_name . DIRECTORY_SEPARATOR. $timestamp;
   if (isset($site['parent_folder'])) {
     $destination = $site['parent_folder'] . DIRECTORY_SEPARATOR . $destination;
   }
   if (isset($site['docroot'])) {
     $fileroot = BACKUPSTMPDIR;
-    $site_archive = $fileroot . DIRECTORY_SEPARATOR . $site_name . '_' . $timestamp . ".tar.gz";
+    $filepath = $fileroot . DIRECTORY_SEPARATOR.$site_name . DIRECTORY_SEPARATOR . $timestamp;
+    shell_exec("mkdir -p ".$filepath);
+    $site_archive = $filepath .DIRECTORY_SEPARATOR. $site_name . '_' . $timestamp . ".tar.gz.part_";
 
     // Create tar.gz file.
     $command = "cd " . $webroot . " && tar";
@@ -71,9 +74,16 @@ function archive($site_name, $site, $webroot = '') {
         $command .= ' --exclude ' . $exclusion;
       }
     }
-    $command .= " -C " . $webroot . DIRECTORY_SEPARATOR . $site['docroot'] . " -cf " . " - . | gzip -9 > " . $site_archive;
+
+    $command .= " -C " . $webroot . DIRECTORY_SEPARATOR . $site['docroot'] . " -cf " . " - . | gzip -9 | split -b ".STORAGELIMIT." - ".$site_archive;
     shell_exec($command);
-    send_archive_to_drive($site, $site_archive, $destination . 'files');
+    foreach (glob($fileroot.DIRECTORY_SEPARATOR.$site_name.DIRECTORY_SEPARATOR.'*') as $bkps_folders) {
+      $bkp_file_idx = 0;
+      foreach (glob($bkps_folders.DIRECTORY_SEPARATOR.'*') as $bkp_file) {
+        send_archive_to_drive($site, $bkp_file, $destination, $bkp_file_idx);
+        $bkp_file_idx += 1;
+      }
+    }
   }
   if (isset($site['dbname'])) {
     $db_archive = $fileroot . DIRECTORY_SEPARATOR . $site['dbname'] . '_' . $timestamp . ".sql.gz";
@@ -103,8 +113,8 @@ function archive($site_name, $site, $webroot = '') {
  * @param bool $cleanup
  *   If true, remove the file after upload.
  */
-function send_archive_to_drive($site, $file_path, $directory, $cleanup = TRUE) {
-  $client = get_client($site);
+function send_archive_to_drive($site, $file_path, $directory, $gIdx = 0, $cleanup = TRUE) {
+  $client = get_client($site, $gIdx);
   $service = new Google_Service_Drive($client);
   $result = uploadArchive($client, $service, $file_path, $directory);
 
@@ -181,19 +191,21 @@ function readFromBigChunk($handle, $chunkSize)
  * @return \Google_Client
  *   The google client.
  */
-function get_client($site) {
+function get_client($site, $gIdx) {
   $client = new Google_Client();
 
   // Get your credentials from the APIs Console.
-  $client->setClientId($site['client_id']);
-  $client->setClientSecret($site['client_secret']);
+  if (!isset($site['client_id'][$gIdx])) throw new Exception("Not enought GStorage", 1);
+  
+  $client->setClientId($site['client_id'][$gIdx]);
+  $client->setClientSecret($site['client_secret'][$gIdx]);
   $client->setRedirectUri(GOOGLEREQUESTURI);
   $client->setAccessType("offline");
   $client->setApprovalPrompt('force');
   $client->setScopes(SCOPES);
 
   $credentials = GOOGLECREDENTIALSPATH.str_replace('.apps.googleusercontent.com', '', $site['client_id']).'.scrt';
-  if (!file_exists($credentials)) {
+  if (!file_exists($credentials) || strpos(file_get_contents($credentials), 'error_description') > 0) {
     // Exchange authorization code for access token.
     $auth_url = $client->createAuthUrl();
     printf("Open the following link in your browser:\n%s\n", $auth_url);
@@ -205,8 +217,14 @@ function get_client($site) {
         xdg-open '" . $auth_url . "'
       fi"
     );
-    print 'Enter verification code: ';
-    $auth_code = trim(fgets(STDIN));
+    print 'Enter verification code at the configuration';
+    if (isset($site['client_code'][$gIdx])) {
+      $auth_code = $site['client_code'][$gIdx];
+    } else {
+      throw new Exception("Missing auth code", 1);
+      
+      //$auth_code = trim(fgets(STDIN));
+    }
     $access_token = $client->authenticate($auth_code);
 
     // Save token for future use.
@@ -220,6 +238,7 @@ function get_client($site) {
   else {
     $access_token = file_get_contents($credentials);
   }
+
   $client->setAccessToken($access_token);
 
   if ($client->isAccessTokenExpired()) {
@@ -345,34 +364,48 @@ function find_archives() {
 function existsBackup($site_name, $site)
 {
   $result = false;
-  $client = get_client($site);
-  $service = new Google_Service_Drive($client);
+  for ($site_drive=0; $site_drive < count($site["client_id"]); $site_drive++) { 
 
-  if (isset($site['remove_after'])) {
-    $remove_after = date('c', strtotime('-' . $site['remove_after']));
-    // Print the names and IDs for up to 10 files.
+    $client = get_client($site, $site_drive);
+    $service = new Google_Service_Drive($client);
+
     $optParams = array(
-      'pageSize' => 100,
-      'q' => '((name contains \'' . $site['dbname'] . '\' and name contains \'.sql.gz\') or (name contains \'' . $site_name . '\' and name contains \'.tar.gz\')) and modifiedTime < \'' . $remove_after . '\''
+      'q' => '(name contains \'' . $site['dbname'] . '\' or name contains \'' . $site_name . '\')
+        and mimeType contains \'folder\' and trashed = false'
     );
-    $files_to_remove = $service->files->listFiles($optParams);
-    if (count($files_to_remove->getFiles()) > 0) {
-      print "Removing Files:\n";
-      foreach ($files_to_remove->getFiles() as $file) {
-        printf("%s (%s)\n", $file->getName(), $file->getId());
-        $service->files->delete($file->getId());
+    $site_folder = $service->files->listFiles($optParams)->getFiles();
+    if (count($site_folder) > 0) {
+      if (isset($site['remove_after'])) {
+        $remove_after = date('c', strtotime('-' . $site['remove_after']));
+        // Print the names and IDs for up to 10 files.
+
+        $optParams = array(
+          'q' => 'modifiedTime < \'' . $remove_after . '\'
+            and parents in \''.$site_folder[0]->getId().'\'
+            and mimeType contains \'folder\' and trashed = false'
+        );
+        $files_to_remove = $service->files->listFiles($optParams);
+        if (count($files_to_remove->getFiles()) > 0) {
+          print "Removing Files:\n";
+          foreach ($files_to_remove->getFiles() as $file) {
+            printf("%s (%s)\n", $file->getName(), $file->getId());
+            $service->files->delete($file->getId());
+          }
+        }
+      }
+      if (isset($site['backup_every'])) {
+        $backup_every = date('c', strtotime('-' . $site['backup_every']));
+        // Print the names and IDs for up to 10 files.
+        $optParams = array(
+          'q' => 'modifiedTime > \'' . $backup_every . '\'
+            and parents in \''.$site_folder[0]->getId().'\'
+            and mimeType contains \'folder\' and trashed = false'
+        );
+
+        $result = count($service->files->listFiles($optParams)->getFiles()) > 0;
       }
     }
-  }
-  if (isset($site['backup_every'])) {
-    $backup_every = date('c', strtotime('-' . $site['backup_every']));
-    // Print the names and IDs for up to 10 files.
-    $optParams = array(
-      'pageSize' => 100,
-      'q' => '((name contains \'' . $site['dbname'] . '\' and name contains \'.sql.gz\') or (name contains \'' . $site_name . '\' and name contains \'.tar.gz\')) and modifiedTime > \'' . $backup_every . '\''
-    );
-    $result = count($service->files->listFiles($optParams)->getFiles()) > 0;
-  }
 
+  }
   return $result;
 }

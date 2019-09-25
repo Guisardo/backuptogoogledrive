@@ -10,8 +10,8 @@
  * Settings required for script execution.
  */
 
-ini_set('memory_limit', '5G'); // Suggested by Sam http://goo.gl/tUw4wY
-$fileroot = __DIR__ . DIRECTORY_SEPARATOR . "tmp";
+ini_set('memory_limit', '5G');
+$fileroot = '/tmp';
 
 $options = getopt("a::", array(
 	"app::"
